@@ -108,7 +108,7 @@ public:
         IntegratorRGBA
     };
 
-    AOVIntegrator(const Properties &props) : Base(props) {
+    AOVIntegrator(const Properties &props) : Base(props), m_integrator_aovs_count(0) {
         std::vector<std::string> tokens = string::tokenize(props.string("aovs"));
 
         for (auto &kv : props.objects()) {
@@ -117,15 +117,19 @@ public:
                 Throw("Child objects must be of type 'SamplingIntegrator'!");
 
             m_integrators.push_back(integrator);
+            m_aov_types.push_back(Type::IntegratorRGBA);
+            m_aov_names.push_back(kv.first + ".R");
+            m_aov_names.push_back(kv.first + ".G");
+            m_aov_names.push_back(kv.first + ".B");
+            m_aov_names.push_back(kv.first + ".A");
+            m_integrator_aovs_count+= 4;
+        }
 
-            if (m_integrators.size() > 1) {
-                m_aov_types.push_back(Type::IntegratorRGBA);
-                m_aov_names.push_back(kv.first + ".R");
-                m_aov_names.push_back(kv.first + ".G");
-                m_aov_names.push_back(kv.first + ".B");
-                m_aov_names.push_back(kv.first + ".A");
-                m_integrator_aovs_count+= 4;
-            }
+        for (auto &kv : props.objects()) {
+            Base *integrator = dynamic_cast<Base *>(kv.second.get());
+            std::vector<std::string> aovs = integrator->aov_names();
+            for (auto name: aovs)
+                m_aov_names.push_back(kv.first + "." + name);
         }
 
         for (const std::string &token: tokens) {
@@ -201,7 +205,7 @@ public:
                                      Sampler * sampler,
                                      const RayDifferential3f &ray,
                                      const Medium * medium,
-                                     Float *aovs,
+                                     Float *_aovs,
                                      Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
 
@@ -227,11 +231,12 @@ public:
             }
         };
 
-        if (m_integrators.size()) {
-            result = m_integrators[0]->sample(scene, sampler, ray, medium, aovs, active);
-        }
+        // We want to pack the channels such that base_channels and inner-integrator
+        // RGBA channels are contiguous
+        Float* aovs_rgba_integrator = _aovs;
+        Float* aovs = _aovs + m_integrator_aovs_count;
 
-        size_t inner_idx = 1;
+        size_t inner_idx = 0;
         for (size_t i = 0; i < m_aov_types.size(); ++i) {
             switch (m_aov_types[i]) {
                 case Type::Albedo: {
@@ -315,18 +320,50 @@ public:
                     break;
 
                 case Type::IntegratorRGBA: {
-                    auto [inner_spec, inner_mask] = m_integrators[inner_idx]->sample(scene, sampler, ray, medium, aovs, active);
-                    Color3f rgb = spectrum_to_color3f(inner_spec, ray, active);
-                    *aovs++ = rgb.r();
-                    *aovs++ = rgb.g();
-                    *aovs++ = rgb.b();
-                    *aovs++ = dr::select(inner_mask, Float(1.f), Float(0.f));
+                    //auto [inner_spec, inner_mask] = m_integrators[inner_idx]->sample(scene, sampler, ray, medium, aovs, active);
+                    aovs += m_integrators[inner_idx]->aov_names().size();
+
+                    Color3f rgb(0); //spectrum_to_color3f(inner_spec, ray, active);
+                    *aovs_rgba_integrator++ = rgb.r();
+                    *aovs_rgba_integrator++ = rgb.g();
+                    *aovs_rgba_integrator++ = rgb.b();
+                    *aovs_rgba_integrator++ = Float(0.f); //dr::select(inner_mask, Float(1.f), Float(0.f));
+
+                    //if (inner_idx == 0)
+                    //    result = {inner_spec, inner_mask};
                     inner_idx++;
-                }
+                } break;
             }
         }
 
         return result;
+    }
+
+
+    TensorXf render(Scene *scene,
+                    Sensor *sensor,
+                    uint32_t seed,
+                    uint32_t spp,
+                    bool develop,
+                    bool evaluate) override {
+
+        std::vector<TensorXf> inner_images;
+        for (auto& integrator : m_integrators) {
+            auto image = integrator->render(scene, sensor, seed, spp, develop, evaluate);
+            inner_images.push_back(image);
+        }
+
+        TensorXf aovs_image;
+        {
+            aovs_image = Base::render(scene, sensor, seed, spp, develop, evaluate);
+
+            // AOVs image above includes film target base channels as well so get slice
+            // just with AOVs
+            size_t num_aovs = m_aov_names.size() - m_integrator_aovs_count;
+            aovs_image = get_channels_slice(aovs_image, aovs_image.shape(2) - num_aovs, num_aovs);
+        }
+
+        return merge_channels(inner_images, aovs_image);
     }
 
     TensorXf render_forward(Scene* scene,
@@ -335,9 +372,8 @@ public:
                             uint32_t seed = 0,
                             uint32_t spp = 0) override {
 
-        TensorXf aovs_grad;
-
         // Perform forward mode propagation just for AOV image
+        TensorXf aovs_grad;
         {
             TensorXf aovs_image = Base::render(scene, sensor, seed, spp);
 
@@ -373,6 +409,7 @@ public:
         auto [image_grads, aovs_grad] = split_channels(base_ch_count, grad_in);
 
         // Perform AD back-propagation just for AOV image
+        m_render_inner_integrators = false;
         {
             TensorXf aovs_image = Base::render(scene, sensor, seed, spp);
 
@@ -383,6 +420,7 @@ public:
 
             dr::backward_from((aovs_image * aovs_grad).array());
         }
+        m_render_inner_integrators = true;
 
         // Let inner integrators handle backwards differentiation for radiance
         for (size_t i = 0, N = image_grads.size(); i < N; ++i)
@@ -504,6 +542,7 @@ protected:
     }
 
 private:
+    bool m_render_inner_integrators = true;
     size_t m_integrator_aovs_count;
     std::vector<Type> m_aov_types;
     std::vector<std::string> m_aov_names;

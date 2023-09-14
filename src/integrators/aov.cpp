@@ -108,7 +108,9 @@ public:
         IntegratorRGBA
     };
 
-    AOVIntegrator(const Properties &props) : Base(props), m_integrator_aovs_count(0) {
+    AOVIntegrator(const Properties &props) : Base(props), 
+        m_render_inner_integrators(true), 
+        m_integrator_aovs_count(0) {
         std::vector<std::string> tokens = string::tokenize(props.string("aovs"));
 
         for (auto &kv : props.objects()) {
@@ -320,17 +322,23 @@ public:
                     break;
 
                 case Type::IntegratorRGBA: {
-                    //auto [inner_spec, inner_mask] = m_integrators[inner_idx]->sample(scene, sampler, ray, medium, aovs, active);
-                    aovs += m_integrators[inner_idx]->aov_names().size();
+                    Color3f rgb(0);
+                    Mask inner_mask = false;
 
-                    Color3f rgb(0); //spectrum_to_color3f(inner_spec, ray, active);
+                    if (m_render_inner_integrators) {
+                        auto [inner_spec, _inner_mask] = m_integrators[inner_idx]->sample(scene, sampler, ray, medium, aovs, active);
+                        rgb = spectrum_to_color3f(inner_spec, ray, active);
+                        inner_mask = _inner_mask;
+                        if (inner_idx == 0)
+                            result = {inner_spec, inner_mask};
+                    }
+
+                    aovs += m_integrators[inner_idx]->aov_names().size();
                     *aovs_rgba_integrator++ = rgb.r();
                     *aovs_rgba_integrator++ = rgb.g();
                     *aovs_rgba_integrator++ = rgb.b();
-                    *aovs_rgba_integrator++ = Float(0.f); //dr::select(inner_mask, Float(1.f), Float(0.f));
+                    *aovs_rgba_integrator++ = dr::select(inner_mask, Float(1.f), Float(0.f));
 
-                    //if (inner_idx == 0)
-                    //    result = {inner_spec, inner_mask};
                     inner_idx++;
                 } break;
             }
@@ -360,10 +368,25 @@ public:
             // AOVs image above includes film target base channels as well so get slice
             // just with AOVs
             size_t num_aovs = m_aov_names.size() - m_integrator_aovs_count;
-            aovs_image = get_channels_slice(aovs_image, aovs_image.shape(2) - num_aovs, num_aovs);
+            if (develop)
+                aovs_image = get_channels_slice(aovs_image, aovs_image.shape(2) - num_aovs, num_aovs);
         }
 
-        return merge_channels(inner_images, aovs_image);
+        if (develop)
+            return merge_channels(inner_images, aovs_image);
+
+        return {};
+    }
+
+    TensorXf render_skip_inner(Scene *scene,
+                    Sensor *sensor,
+                    uint32_t seed,
+                    uint32_t spp) {
+        m_render_inner_integrators = false;
+        TensorXf res = Base::render(scene, sensor, seed, spp);
+        m_render_inner_integrators = true;
+
+        return res;
     }
 
     TensorXf render_forward(Scene* scene,
@@ -375,7 +398,7 @@ public:
         // Perform forward mode propagation just for AOV image
         TensorXf aovs_grad;
         {
-            TensorXf aovs_image = Base::render(scene, sensor, seed, spp);
+            TensorXf aovs_image = render_skip_inner(scene, sensor, seed, spp);
 
             // AOVs image above includes film target base channels as well so get slice
             // just with AOVs
@@ -409,9 +432,8 @@ public:
         auto [image_grads, aovs_grad] = split_channels(base_ch_count, grad_in);
 
         // Perform AD back-propagation just for AOV image
-        m_render_inner_integrators = false;
         {
-            TensorXf aovs_image = Base::render(scene, sensor, seed, spp);
+            TensorXf aovs_image = render_skip_inner(scene, sensor, seed, spp);
 
             // AOVs image above includes film target base channels as well so get slice
             // just with AOVs
@@ -420,7 +442,6 @@ public:
 
             dr::backward_from((aovs_image * aovs_grad).array());
         }
-        m_render_inner_integrators = true;
 
         // Let inner integrators handle backwards differentiation for radiance
         for (size_t i = 0, N = image_grads.size(); i < N; ++i)
@@ -542,7 +563,7 @@ protected:
     }
 
 private:
-    bool m_render_inner_integrators = true;
+    bool m_render_inner_integrators;
     size_t m_integrator_aovs_count;
     std::vector<Type> m_aov_types;
     std::vector<std::string> m_aov_names;

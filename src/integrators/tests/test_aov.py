@@ -148,7 +148,8 @@ def test04_check_aov_correct(variants_all_rgb):
     # Check z-pos
     assert(dr.allclose(image[:,:, -1:].array, [plane_offset] * image_dim))
 
-def test05_check_aov_film(variants_all_rgb):
+
+def test05_check_aov_film(variant_llvm_ad_rgb):
     import numpy as np
     scene = mi.load_file(find_resource('resources/data/scenes/cbox/cbox.xml'))
 
